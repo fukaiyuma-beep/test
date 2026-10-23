@@ -1,0 +1,805 @@
+--[[ ═══════════════════════════════════════════════════════════════════════
+     CON EX • SERVER HOPPER   v1.1
+     auto-hop -> fullest server you can actually join, then stand guard
+     ═══════════════════════════════════════════════════════════════════════
+
+     WHAT IT DOES  (mode: AUTO-HOP, default)
+       • scans roblox's official public server list for the game you're in
+       • if your current server has MinPlayers (4) or fewer players ->
+         auto-hops to the fullest server you can actually join
+       • lands, waits a moment in case it fills up, still empty -> hops again
+       • once you're in a populated server it STANDS GUARD: keeps watching,
+         and if the count ever drops to <= MinPlayers again it hops you out
+       • destinations prefer near-full servers (within FullThreshold slots),
+         but if none exist it takes the fullest server with more players
+         than yours - so you always move somewhere better
+
+     MODE: FULLEST (old v1.0 behavior, toggle in the panel)
+       • chain-hops until it lands in a server within FullThreshold of full,
+         then stops
+
+     WHY IT'S CLEAN
+       • zero game hooks, zero memory edits - teleporting is a normal
+         roblox feature, so there is nothing for any game anticheat to
+         see. the script only ever talks to roblox's own servers
+       • human-like jittered delays (never one fixed bot interval)
+       • rate-limit aware - backs off on HTTP 429 instead of spamming
+       • hop budget + rest period so roblox never flags teleport spam
+       • never wastes a teleport on a truly full (unjoinable) server
+
+     HOW TO USE
+       1. join the game
+       2. edit CONFIG below if you want
+       3. paste + execute - it starts on its own
+       4. the mode button in the panel switches AUTO-HOP / FULLEST
+       5. STOP button any time
+
+     works in any game / any executor with request (or http) support
+
+     v1.1 CHANGELOG
+       + AUTO-HOP mode: hop out when server <= MinPlayers (default 4)
+       + stands guard after landing - re-hops if players leave later
+       + LowConfirmTicks: needs 2 low readings in a row (no false triggers)
+       + smarter destination: near-full first, else fullest better server
+       + landing verify window: just-joined low server gets VERIFY_SEC
+         to fill up before deciding it's bad
+       + mode toggle button in the panel
+═══════════════════════════════════════════════════════════════════════ ]]
+
+--// ═══ SERVICES ═══════════════════════════════════════════════════════════
+local Players          = game:GetService("Players")
+local TeleportService  = game:GetService("TeleportService")
+local HttpService      = game:GetService("HttpService")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui       = game:GetService("StarterGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+--// ═══ CONFIG ══════════════════════════════════════════════════════════════
+local CONFIG = {
+	HopMode          = "lowplayers", -- "lowplayers" = auto-hop when server goes empty (default)
+	                                -- "fullest"    = chase near-full servers (v1.0 behavior)
+	MinPlayers       = 4,    -- lowplayers mode: hop away when the server drops to this many players or fewer
+	LowConfirmTicks  = 2,    -- low readings in a row (~5-9s apart) before hopping (avoids false triggers)
+	FullThreshold    = 2,    -- fullest mode: hop until within this many slots of full / destination preference
+	MaxServersScan   = 400,  -- servers to scan per cycle (pages of 100)
+	HopDelayMin      = 3,    -- seconds between teleports (randomised in range)
+	HopDelayMax      = 7,
+	ApiDelayMin      = 1.5,  -- seconds between api pages (randomised)
+	ApiDelayMax      = 3,
+	HopBudget        = 30,   -- max hops before a rest
+	RestSeconds      = 180,  -- rest length after budget is spent
+	LandingVerifySec = 15,   -- a just-joined low server gets this long to fill up before we call it bad
+	AutoResume       = true, -- keep guarding / hopping after every teleport
+	AutoStart        = true, -- start immediately on execute
+	ShowGui          = true,
+}
+
+local RESUME_FILE = "ConEx_Hopper_resume.lua"
+
+--// ═══ STATE ═══════════════════════════════════════════════════════════════
+local RNG = Random.new()
+local State = {
+	running = false,
+	hops    = 0,
+	status  = "idle",
+	info    = "ready",
+}
+
+local function jitter(min, max)
+	return RNG:NextNumber(min, max)
+end
+
+local function sleep(sec)
+	local t = 0
+	while t < sec do
+		if not State.running then break end
+		local step = math.min(0.25, sec - t)
+		task.wait(step)
+		t = t + step
+	end
+end
+
+local function notifyLocal(text)
+	pcall(function()
+		StarterGui:SetCore("SendNotification", {
+			Title = "CON EX - HOPPER",
+			Text  = text,
+			Duration = 4,
+		})
+	end)
+end
+
+--// ═══ AUTO-RESUME PAYLOAD (queued on teleport) ════════════════════════════
+local RESUME_TEMPLATE = [==[
+--// CON EX - SERVER HOPPER :: auto-resume payload (v1.1)
+--// generated by the main hopper - after landing it verifies the server
+--// and either keeps hopping (bad server) or stands guard (good server)
+
+local MODE        = @@MODE@@
+local THRESHOLD   = @@TH@@
+local MINPLAYERS  = @@MINP@@
+local CONFIRM     = @@CONFIRM@@
+local VERIFY_SEC  = @@VERIFY@@
+local HOP_MIN     = @@HOPMIN@@
+local HOP_MAX     = @@HOPMAX@@
+local API_MIN     = @@APIMIN@@
+local API_MAX     = @@APIMAX@@
+local RESUME_FILE = "ConEx_Hopper_resume.lua"
+local MAX_FAILS   = 8
+
+local Players         = game:GetService("Players")
+local HttpService     = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local RNG             = Random.new()
+
+local function jitter(a, b) return RNG:NextNumber(a, b) end
+
+local function notify(text)
+	pcall(function()
+		game:GetService("StarterGui"):SetCore("SendNotification", {
+			Title = "CON EX - HOPPER", Text = text, Duration = 5
+		})
+	end)
+end
+
+-- wait for the new server
+while not Players.LocalPlayer do task.wait(0.2) end
+task.wait(3) -- let the player list replicate
+
+local function nPlayers() return #Players:GetPlayers() end
+local function nearFull(n) return (Players.MaxPlayers - n) <= THRESHOLD end
+
+-- http
+local httpFunc = (typeof(syn) == "table" and syn.request)
+	or http_request or request or (http and http.request)
+local lastCall = 0
+
+local function apiGet(url)
+	local since = os.clock() - lastCall
+	local gap = jitter(API_MIN, API_MAX)
+	if since < gap then task.wait(gap - since) end
+	lastCall = os.clock()
+	if not httpFunc then return nil end
+	local ok, res = pcall(httpFunc, {
+		Url = url, Method = "GET",
+		Headers = { accept = "application/json" }
+	})
+	if not ok or type(res) ~= "table" then return nil end
+	local code = tonumber(res.StatusCode or res.code) or 0
+	if code ~= 200 then
+		if code == 429 then
+			task.wait(jitter(8, 14)) -- rate-limit backoff
+		end
+		return nil
+	end
+	return res.Body or res.body
+end
+
+local function findTarget(mode, count)
+	local best, cursor = nil, ""
+	for _ = 1, 5 do
+		local body = apiGet(("https://games.roblox.com/v1/games/%d/servers/Public?limit=100&excludeFullGames=true&sortOrder=Desc&cursor=%s")
+			:format(game.PlaceId, cursor))
+		if not body then break end
+		local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
+		if not ok or type(data) ~= "table" or type(data.data) ~= "table" then break end
+		for _, s in ipairs(data.data) do
+			if s.id and s.id ~= game.JobId
+				and type(s.playing) == "number" and type(s.maxPlayers) == "number"
+				and s.maxPlayers > s.playing
+				and ((mode == "full" and (s.maxPlayers - s.playing) <= THRESHOLD)
+					or (mode == "low" and s.playing > count)) then
+				if not best or s.playing > best.playing then best = s end
+			end
+		end
+		cursor = data.nextPageCursor or ""
+		if cursor == "" or best then break end
+	end
+	return best
+end
+
+local function tryHop(target)
+	notify(("hopping - target %d/%d"):format(target.playing, target.maxPlayers))
+	task.wait(jitter(HOP_MIN, HOP_MAX))
+	local ok = pcall(function()
+		TeleportService:TeleportToPlaceInstance(game.PlaceId, target.id, Players.LocalPlayer)
+	end)
+	if ok then
+		-- re-arm for the next landing
+		pcall(function()
+			local q = queue_on_teleport or teleport_queue
+			if q and readfile and isfile and isfile(RESUME_FILE) then
+				q(readfile(RESUME_FILE))
+			end
+		end)
+	end
+	return ok
+end
+
+-- landing verdict (give a low server a moment to fill up first)
+local count = nPlayers()
+if count <= MINPLAYERS then
+	local deadline = os.clock() + VERIFY_SEC
+	while os.clock() < deadline and count <= MINPLAYERS do
+		task.wait(1)
+		count = nPlayers()
+	end
+end
+
+if MODE == "full" and nearFull(count) then
+	notify(("full server reached - %d/%d"):format(count, Players.MaxPlayers))
+	return
+end
+
+if MODE == "low" and count > MINPLAYERS then
+	notify(("landed in populated server (%d/%d) - watching"):format(count, Players.MaxPlayers))
+end
+
+-- guardian loop
+local fails = 0
+local lowTicks = (count <= MINPLAYERS) and CONFIRM or 0
+while true do
+	local n = nPlayers()
+	local target = nil
+
+	if MODE == "full" then
+		if nearFull(n) then
+			notify(("full server reached - %d/%d"):format(n, Players.MaxPlayers))
+			return
+		end
+		target = findTarget("full", 0)
+	else
+		if n <= MINPLAYERS then lowTicks = lowTicks + 1 else lowTicks = 0 end
+		if lowTicks >= CONFIRM then
+			target = findTarget("low", n)
+		end
+	end
+
+	if target then
+		if tryHop(target) then return end
+		fails = fails + 1
+		if fails >= MAX_FAILS then
+			notify("hopper gave up - too many failed hops")
+			return
+		end
+		task.wait(jitter(3, 6))
+		lowTicks = 0
+	elseif MODE == "full" then
+		notify("no near-full servers right now - retrying")
+		task.wait(jitter(6, 12))
+	end
+
+	task.wait(jitter(5, 9))
+end
+]==]
+
+local function buildResumeSource()
+	local src = RESUME_TEMPLATE
+	src = src:gsub("@@MODE@@",    function() return "'" .. CONFIG.HopMode .. "'" end)
+	src = src:gsub("@@TH@@",      function() return tostring(CONFIG.FullThreshold) end)
+	src = src:gsub("@@MINP@@",    function() return tostring(CONFIG.MinPlayers) end)
+	src = src:gsub("@@CONFIRM@@", function() return tostring(CONFIG.LowConfirmTicks) end)
+	src = src:gsub("@@VERIFY@@",  function() return tostring(CONFIG.LandingVerifySec) end)
+	src = src:gsub("@@HOPMIN@@",  function() return tostring(CONFIG.HopDelayMin) end)
+	src = src:gsub("@@HOPMAX@@",  function() return tostring(CONFIG.HopDelayMax) end)
+	src = src:gsub("@@APIMIN@@",  function() return tostring(CONFIG.ApiDelayMin) end)
+	src = src:gsub("@@APIMAX@@",  function() return tostring(CONFIG.ApiDelayMax) end)
+	return src
+end
+
+--// ═══ HTTP LAYER (rate-limit friendly) ════════════════════════════════════
+local httpFunc = (typeof(syn) == "table" and syn.request)
+	or http_request or request or (http and http.request)
+
+local lastApiCall = 0
+
+local function apiGet(url)
+	-- space calls out so we never hammer the api
+	local since = os.clock() - lastApiCall
+	local gap = jitter(CONFIG.ApiDelayMin, CONFIG.ApiDelayMax)
+	if since < gap then task.wait(gap - since) end
+	lastApiCall = os.clock()
+
+	local ok, res = pcall(function()
+		if httpFunc then
+			return httpFunc({
+				Url = url, Method = "GET",
+				Headers = { accept = "application/json" },
+			})
+		end
+		return { StatusCode = 200, Body = HttpService:GetAsync(url) }
+	end)
+	if not ok or type(res) ~= "table" then
+		return nil, "request failed"
+	end
+
+	local code = tonumber(res.StatusCode or res.code) or 0
+	if code == 429 then
+		-- politely back off instead of spamming
+		State.info = "rate limited - backing off"
+		task.wait(jitter(8, 14))
+		return nil, 429
+	end
+	if code ~= 200 then
+		return nil, code
+	end
+	return res.Body or res.body
+end
+
+--// ═══ SERVER SCAN ═════════════════════════════════════════════════════════
+-- accept(server) decides what counts as a target, e.g.
+--   near-full filter : function(s) return (s.maxPlayers - s.playing) <= 2 end
+--   better-than-here : function(s) return s.playing > myCount end
+local function fetchJoinableServers(isManual, accept)
+	local keepGoing = function() return State.running or isManual end
+	local found    = {}
+	local scanned  = 0
+	local cursor   = ""
+
+	while keepGoing() and scanned < CONFIG.MaxServersScan do
+		local url = ("https://games.roblox.com/v1/games/%d/servers/Public?limit=100&excludeFullGames=true&sortOrder=Desc&cursor=%s")
+			:format(game.PlaceId, cursor)
+
+		local body, err = apiGet(url)
+		if not body then
+			if scanned > 0 then break end
+			return nil, err
+		end
+
+		local ok, data = pcall(HttpService.JSONDecode, HttpService, body)
+		if not ok or type(data) ~= "table" or type(data.data) ~= "table" then
+			if scanned > 0 then break end
+			return nil, "bad api response"
+		end
+
+		for _, s in ipairs(data.data) do
+			scanned = scanned + 1
+			if s.id and s.id ~= game.JobId
+				and type(s.playing) == "number" and type(s.maxPlayers) == "number"
+				and s.maxPlayers > s.playing
+				and (not accept or accept(s)) then
+				table.insert(found, s)
+			end
+		end
+
+		State.info = ("scanned %d servers - %d target(s)"):format(scanned, #found)
+
+		cursor = data.nextPageCursor or ""
+		if cursor == "" then break end
+		task.wait(jitter(CONFIG.ApiDelayMin, CONFIG.ApiDelayMax))
+	end
+
+	-- fullest first
+	table.sort(found, function(a, b) return a.playing > b.playing end)
+	return found
+end
+
+--// ═══ TELEPORT ════════════════════════════════════════════════════════════
+local function armResume()
+	if not CONFIG.AutoResume then return end
+	local q = queue_on_teleport or teleport_queue
+	if not q then return end
+	pcall(function()
+		if writefile then
+			writefile(RESUME_FILE, buildResumeSource())
+		end
+		if readfile and (typeof(isfile) ~= "function" or isfile(RESUME_FILE)) then
+			q(readfile(RESUME_FILE))
+		end
+	end)
+end
+
+local function teleportTo(server)
+	State.info = ("connecting to server %d/%d ..."):format(server.playing, server.maxPlayers)
+	local ok, err = pcall(function()
+		TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, LocalPlayer)
+	end)
+	if not ok then
+		State.info = "teleport error: " .. tostring(err)
+	end
+	return ok
+end
+
+-- arms the resume payload, teleports, and watches whether we actually left
+local function attemptHop(target)
+	State.status = "hopping"
+	State.hops = State.hops + 1
+	armResume()
+	local jobAtStart = game.JobId
+	local ok = teleportTo(target)
+	if not ok then
+		sleep(jitter(3, 6))
+		return "failed"
+	end
+	State.info = "teleporting..."
+	local t = 0
+	while State.running and t < 20 and game.JobId == jobAtStart do
+		task.wait(0.5)
+		t = t + 0.5
+	end
+	if game.JobId ~= jobAtStart then
+		return "gone" -- in the air; resume payload takes over
+	end
+	State.info = "teleport didn't go through - retrying"
+	return "stayed"
+end
+
+--// ═══ HOP LOOPS ═══════════════════════════════════════════════════════════
+local function startHopper()
+	if State.running then return end
+	State.running = true
+	State.hops    = 0
+	State.status  = "starting"
+	State.info    = "checking current server"
+
+	task.spawn(function()
+		task.wait(2) -- brief settle so the player list is accurate
+
+		-- already low right now? skip the confirm grace, hop immediately
+		local lowTicks = (#Players:GetPlayers() <= CONFIG.MinPlayers)
+			and CONFIG.LowConfirmTicks or 0
+
+		while State.running do
+			-- shared hop budget
+			if State.hops >= CONFIG.HopBudget then
+				State.status = "resting"
+				State.info = ("hop budget spent - resting %ds to stay clean"):format(CONFIG.RestSeconds)
+				sleep(CONFIG.RestSeconds)
+				State.hops = 0
+				if not State.running then break end
+			end
+
+			local mode = CONFIG.HopMode
+			local n = #Players:GetPlayers()
+			local accept = nil
+			local done = false
+
+			if mode == "fullest" then
+				if (Players.MaxPlayers - n) <= CONFIG.FullThreshold then
+					done = true
+				else
+					accept = function(s)
+						return (s.maxPlayers - s.playing) <= CONFIG.FullThreshold
+					end
+				end
+			else
+				if n <= CONFIG.MinPlayers then
+					lowTicks = lowTicks + 1
+				else
+					lowTicks = 0
+				end
+				if lowTicks >= CONFIG.LowConfirmTicks then
+					local cur = n
+					accept = function(s) return s.playing > cur end
+				end
+			end
+
+			if done then
+				State.status = "done"
+				State.info = ("full server reached (%d/%d)"):format(n, Players.MaxPlayers)
+				notifyLocal("full server reached - staying here")
+				State.running = false
+				break
+			end
+
+			if accept then
+				State.status = "scanning"
+				if mode ~= "fullest" then
+					State.info = ("server low (%d/%d) - looking for a better one")
+						:format(n, Players.MaxPlayers)
+				end
+				local list, err = fetchJoinableServers(false, accept)
+				if not State.running then break end
+
+				if not list or #list == 0 then
+					State.info = err and ("scan error: " .. tostring(err) .. " - retrying")
+						or (mode == "fullest"
+							and "no near-full servers right now - rescanning"
+							or ("no better server right now (you have %d players)"):format(n))
+					sleep(jitter(4, 8))
+					lowTicks = 0
+				else
+					local t = list[1] -- fullest joinable target
+					State.status = "hopping"
+					State.hops = State.hops + 1
+					State.info = ("target: %d/%d - hopping in %.1fs")
+						:format(t.playing, t.maxPlayers, jitter(CONFIG.HopDelayMin, CONFIG.HopDelayMax))
+					sleep(jitter(CONFIG.HopDelayMin, CONFIG.HopDelayMax))
+					if not State.running then break end
+
+					local result = attemptHop(t)
+					if result == "gone" then
+						return -- in the air; resume payload takes over
+					end
+					lowTicks = 0
+					sleep(jitter(3, 6))
+				end
+			else
+				State.status = "watching"
+				if lowTicks > 0 then
+					State.info = ("players leaving (%d/%d) - confirm %d/%d")
+						:format(n, Players.MaxPlayers, lowTicks, CONFIG.LowConfirmTicks)
+				else
+					State.info = ("server ok (%d/%d) - watching")
+						:format(n, Players.MaxPlayers)
+				end
+				sleep(jitter(5, 9))
+			end
+		end
+
+		if State.status ~= "done" then
+			State.status = "stopped"
+		end
+	end)
+end
+
+local function stopHopper()
+	State.running = false
+	State.status  = "stopped"
+	State.info    = "hopper stopped"
+end
+
+local function singleHop()
+	task.spawn(function()
+		State.status = "scanning"
+		local n = #Players:GetPlayers()
+		local list, err = fetchJoinableServers(true, function(s)
+			return s.playing > n
+		end)
+		if list and #list > 0 then
+			local t = list[1]
+			State.status = "hopping"
+			State.info = ("manual hop -> %d/%d"):format(t.playing, t.maxPlayers)
+			armResume()
+			teleportTo(t)
+		else
+			State.info = err and ("scan error: " .. tostring(err)) or "no fuller server available right now"
+			State.status = "idle"
+		end
+	end)
+end
+
+--// ═══ GUI ══════════════════════════════════════════════════════════════════
+local gui, statusLabel, infoLabel
+
+local function modeText()
+	if CONFIG.HopMode == "fullest" then
+		return ("mode: FULLEST - chase servers within %d of full"):format(CONFIG.FullThreshold)
+	end
+	return ("mode: AUTO-HOP when server <= %d players"):format(CONFIG.MinPlayers)
+end
+
+local function mk(class, props, parent)
+	local inst = Instance.new(class)
+	for k, v in pairs(props) do
+		inst[k] = v
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local function buildGui()
+	if not CONFIG.ShowGui then return end
+
+	-- tear down an older panel from a previous execute
+	if getgenv().ConExHopGui then
+		pcall(function() getgenv().ConExHopGui:Destroy() end)
+		getgenv().ConExHopGui = nil
+	end
+
+	-- protected hosting chain: gethui -> CoreGui -> PlayerGui
+	local parent = game:GetService("CoreGui")
+	pcall(function()
+		if typeof(gethui) == "function" then
+			local h = gethui()
+			if h then parent = h end
+		end
+	end)
+
+	local ok = pcall(function()
+		gui = Instance.new("ScreenGui")
+		gui.Name = "ConExHopper"
+		gui.ResetOnSpawn = false
+		gui.DisplayOrder = 9999
+		gui.Parent = parent
+	end)
+	if not ok or not gui then
+		gui = Instance.new("ScreenGui")
+		gui.Name = "ConExHopper"
+		gui.ResetOnSpawn = false
+		gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+	end
+	getgenv().ConExHopGui = gui
+
+	local frame = mk("Frame", {
+		Size = UDim2.fromOffset(270, 158),
+		Position = UDim2.new(0, 20, 0, 20),
+		BackgroundColor3 = Color3.fromRGB(17, 20, 27),
+		BorderSizePixel = 0,
+		Active = true,
+	}, gui)
+	mk("UICorner", { CornerRadius = UDim.new(0, 8) }, frame)
+	mk("UIStroke", { Color = Color3.fromRGB(60, 70, 95), Thickness = 1 }, frame)
+
+	local titleBar = mk("Frame", {
+		Size = UDim2.new(1, 0, 0, 26),
+		BackgroundColor3 = Color3.fromRGB(23, 28, 38),
+		BorderSizePixel = 0,
+	}, frame)
+	mk("UICorner", { CornerRadius = UDim.new(0, 8) }, titleBar)
+
+	mk("TextLabel", {
+		Size = UDim2.new(1, -30, 1, 0),
+		Position = UDim2.fromOffset(10, 0),
+		BackgroundTransparency = 1,
+		Text = "CON EX  •  SERVER HOPPER",
+		TextColor3 = Color3.fromRGB(235, 238, 245),
+		TextSize = 13,
+		Font = Enum.Font.GothamBold,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, titleBar)
+
+	local closeBtn = mk("TextButton", {
+		Size = UDim2.fromOffset(22, 22),
+		Position = UDim2.new(1, -26, 0, 2),
+		BackgroundTransparency = 1,
+		Text = "X",
+		TextColor3 = Color3.fromRGB(150, 155, 165),
+		TextSize = 13,
+		Font = Enum.Font.GothamBold,
+	}, titleBar)
+
+	statusLabel = mk("TextLabel", {
+		Size = UDim2.new(1, -20, 0, 18),
+		Position = UDim2.fromOffset(12, 32),
+		BackgroundTransparency = 1,
+		Text = "status: idle",
+		TextColor3 = Color3.fromRGB(120, 220, 160),
+		TextSize = 13,
+		Font = Enum.Font.Gotham,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, frame)
+
+	infoLabel = mk("TextLabel", {
+		Size = UDim2.new(1, -20, 0, 34),
+		Position = UDim2.fromOffset(12, 50),
+		BackgroundTransparency = 1,
+		Text = "ready",
+		TextColor3 = Color3.fromRGB(150, 155, 170),
+		TextSize = 12,
+		Font = Enum.Font.Gotham,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextWrapped = true,
+	}, frame)
+
+	local function makeBtn(text, x, w, color)
+		local b = mk("TextButton", {
+			Size = UDim2.new(0, w, 0, 26),
+			Position = UDim2.new(0, x, 0, 96),
+			BackgroundColor3 = color,
+			Text = text,
+			TextColor3 = Color3.fromRGB(235, 238, 245),
+			TextSize = 12,
+			Font = Enum.Font.GothamBold,
+			BorderSizePixel = 0,
+			AutoButtonColor = true,
+		}, frame)
+		mk("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+		return b
+	end
+
+	local startBtn = makeBtn("START", 12, 74, Color3.fromRGB(46, 120, 80))
+	local stopBtn  = makeBtn("STOP", 92, 74, Color3.fromRGB(130, 60, 60))
+	local onceBtn  = makeBtn("HOP ONCE", 172, 86, Color3.fromRGB(52, 76, 130))
+
+	-- mode toggle (click to switch AUTO-HOP <-> FULLEST)
+	local modeBtn = mk("TextButton", {
+		Size = UDim2.new(1, -24, 0, 22),
+		Position = UDim2.new(0, 12, 0, 128),
+		BackgroundColor3 = Color3.fromRGB(30, 36, 48),
+		Text = modeText(),
+		TextColor3 = Color3.fromRGB(160, 190, 235),
+		TextSize = 11,
+		Font = Enum.Font.Gotham,
+		BorderSizePixel = 0,
+		AutoButtonColor = true,
+		TextWrapped = true,
+	}, frame)
+	mk("UICorner", { CornerRadius = UDim.new(0, 6) }, modeBtn)
+	modeBtn.Activated:Connect(function()
+		CONFIG.HopMode = (CONFIG.HopMode == "fullest") and "lowplayers" or "fullest"
+		modeBtn.Text = modeText()
+		if State.running then
+			State.info = "mode switched to " .. CONFIG.HopMode
+		end
+	end)
+
+	closeBtn.Activated:Connect(function()
+		stopHopper()
+		if gui then gui:Destroy() end
+		gui = nil
+	end)
+	startBtn.Activated:Connect(startHopper)
+	stopBtn.Activated:Connect(stopHopper)
+	onceBtn.Activated:Connect(function()
+		if not State.running then
+			singleHop()
+		end
+	end)
+
+	-- dragging (title bar)
+	do
+		local dragging = false
+		local dragStart, startPos
+		titleBar.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				dragStart = input.Position
+				startPos = frame.Position
+			end
+		end)
+		UserInputService.InputChanged:Connect(function(input)
+			if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+				or input.UserInputType == Enum.UserInputType.Touch) then
+				local delta = input.Position - dragStart
+				frame.Position = UDim2.new(
+					startPos.X.Scale, startPos.X.Offset + delta.X,
+					startPos.Y.Scale, startPos.Y.Offset + delta.Y
+				)
+			end
+		end)
+		UserInputService.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1
+				or input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end)
+	end
+
+	-- live status refresh
+	task.spawn(function()
+		while gui and gui.Parent do
+			if statusLabel and statusLabel.Parent then
+				statusLabel.Text = "status: " .. State.status
+			end
+			if infoLabel and infoLabel.Parent then
+				infoLabel.Text = (State.info ~= "" and State.info) or "-"
+			end
+			task.wait(0.25)
+		end
+	end)
+end
+
+--// ═══ BOOT ═════════════════════════════════════════════════════════════════
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
+while not LocalPlayer do
+	task.wait(0.2)
+	LocalPlayer = Players.LocalPlayer
+end
+
+-- double-execute guard: stop the previous instance cleanly
+if typeof(getgenv().ConExHopStop) == "function" then
+	pcall(getgenv().ConExHopStop)
+	task.wait(0.3)
+end
+getgenv().ConExHopStop = stopHopper
+
+buildGui()
+
+TeleportService.TeleportInitFailed:Connect(function(_, result)
+	if State.running then
+		State.info = "teleport failed (" .. tostring(result) .. ") - retrying"
+	end
+end)
+
+if not httpFunc then
+	notifyLocal("executor has no request/http support - can't scan servers")
+	State.info = "no request/http support in this executor"
+elseif CONFIG.AutoStart then
+	startHopper()
+	notifyLocal(("hopper started (%s mode)"):format(CONFIG.HopMode))
+end
